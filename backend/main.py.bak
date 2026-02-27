@@ -1,0 +1,340 @@
+"""
+PathFinder AI - FastAPI Backend
+Trust-First Intelligent Campus Placement ERP
+Team algoRhythmss | Hackathon 2026
+"""
+import sys, os, uuid, datetime, json
+from typing import Optional, List
+sys.path.insert(0, os.path.dirname(__file__))
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from database.models import Base, engine, get_db, Student, PlacementDrive, Application, AuditLog
+from database.seed import seed_database
+from ai_engine.policy_gateway import check_eligibility
+from ai_engine.matcher import compute_crs, extract_skills_from_text
+from ai_engine.audit_logger import create_log, get_logs, export_logs_json, export_logs_csv
+
+app = FastAPI(title="PathFinder AI", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(bind=engine)
+    seed_database()
+
+def safe_list(val):
+    if val is None: return []
+    if isinstance(val, list): return val
+    if isinstance(val, str):
+        try:
+            p = json.loads(val)
+            return p if isinstance(p, list) else []
+        except: return []
+    return []
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
+class StudentCreate(BaseModel):
+    name: str; email: str; branch: str; cgpa: float
+    active_backlogs: int = 0; graduation_year: int = 2025
+    skills: List[str] = []; projects: List[str] = []
+    certifications: List[str] = []; phone: Optional[str] = None
+    resume_text: Optional[str] = None
+
+class DriveCreate(BaseModel):
+    company_name: str; job_role: str; jd_text: Optional[str] = None
+    required_skills: List[str] = []; min_cgpa: float = 6.0
+    max_backlogs: int = 0; eligible_branches: List[str] = []
+    location: Optional[str] = None; package_min: Optional[float] = None
+    package_max: Optional[float] = None; drive_date: Optional[str] = None
+
+class ApplyRequest(BaseModel):
+    student_id: str; drive_id: str
+
+class ShortlistRequest(BaseModel):
+    student_id: str; drive_id: str; approved_by: str = "TPO"
+
+# ── Student Routes ────────────────────────────────────────────────────────────
+@app.get("/students", tags=["Students"])
+def list_students(db: Session = Depends(get_db)):
+    return [_student_dict(s) for s in db.query(Student).all()]
+
+@app.get("/students/{student_id}", tags=["Students"])
+def get_student(student_id: str, db: Session = Depends(get_db)):
+    s = db.query(Student).filter(Student.id == student_id).first()
+    if not s: raise HTTPException(404, "Student not found")
+    return _student_dict(s)
+
+@app.post("/students", tags=["Students"])
+def create_student(data: StudentCreate, db: Session = Depends(get_db)):
+    if db.query(Student).filter(Student.email == data.email).first():
+        raise HTTPException(400, f"Email {data.email} already registered")
+    s_id = f"STU_{datetime.datetime.utcnow().year}_{str(uuid.uuid4())[:6].upper()}"
+    student = Student(id=s_id, name=data.name, email=data.email, branch=data.branch,
+                      cgpa=data.cgpa, active_backlogs=data.active_backlogs,
+                      graduation_year=data.graduation_year, skills=data.skills,
+                      projects=data.projects, certifications=data.certifications,
+                      phone=data.phone, resume_text=data.resume_text)
+    db.add(student); db.commit(); db.refresh(student)
+    return _student_dict(student)
+
+@app.post("/upload-resume", tags=["Students"])
+async def upload_resume(student_id: str = Form(...), resume_text: str = Form(None),
+                        file: UploadFile = File(None), db: Session = Depends(get_db)):
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student: raise HTTPException(404, "Student not found")
+    extracted_text = resume_text or ""
+    if file:
+        content = await file.read()
+        fname = file.filename or ""
+        if fname.lower().endswith(".pdf"):
+            try:
+                from pdfminer.high_level import extract_text_to_fp
+                from pdfminer.layout import LAParams
+                import io
+                out = io.StringIO()
+                extract_text_to_fp(io.BytesIO(content), out, laparams=LAParams())
+                extracted_text = out.getvalue()
+            except Exception:
+                extracted_text = content.decode("utf-8", errors="ignore")
+        else:
+            extracted_text = content.decode("utf-8", errors="ignore")
+    if not extracted_text.strip():
+        raise HTTPException(400, "No content found. Please paste text or upload a valid PDF.")
+    new_skills = extract_skills_from_text(extracted_text)
+    merged = list(set(safe_list(student.skills)).union(set(new_skills)))
+    student.skills = merged; student.resume_text = extracted_text
+    db.commit()
+    return {"message": "Resume uploaded successfully", "student_id": student_id,
+            "extracted_skills": new_skills, "total_skills": merged}
+
+@app.get("/eligibility/{student_id}", tags=["Students"])
+def get_eligibility(student_id: str, db: Session = Depends(get_db)):
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student: raise HTTPException(404, "Student not found")
+    drives = db.query(PlacementDrive).filter(PlacementDrive.status == "active").all()
+    results = []
+    for drive in drives:
+        pr = check_eligibility(_student_dict(student), _drive_dict(drive))
+        results.append({"drive_id": drive.id, "company_name": drive.company_name,
+                        "job_role": drive.job_role, "eligible": pr["passed"],
+                        "checks": pr["checks"], "reasoning": pr["reasoning"]})
+    return {"student_id": student_id, "student_name": student.name, "eligibility": results}
+
+# ── Drive Routes ──────────────────────────────────────────────────────────────
+@app.get("/drives", tags=["Drives"])
+def list_drives(db: Session = Depends(get_db)):
+    return [_drive_dict(d) for d in db.query(PlacementDrive).all()]
+
+@app.get("/drives/{drive_id}", tags=["Drives"])
+def get_drive(drive_id: str, db: Session = Depends(get_db)):
+    d = db.query(PlacementDrive).filter(PlacementDrive.id == drive_id).first()
+    if not d: raise HTTPException(404, "Drive not found")
+    return _drive_dict(d)
+
+@app.post("/create-drive", tags=["Drives"])
+def create_drive(data: DriveCreate, db: Session = Depends(get_db)):
+    drive_id = f"DRIVE_{data.company_name.upper().replace(' ','_')}_{str(uuid.uuid4())[:6].upper()}"
+    skills = data.required_skills or (extract_skills_from_text(data.jd_text) if data.jd_text else [])
+    drive = PlacementDrive(id=drive_id, company_name=data.company_name, job_role=data.job_role,
+                           jd_text=data.jd_text, required_skills=skills, min_cgpa=data.min_cgpa,
+                           max_backlogs=data.max_backlogs, eligible_branches=data.eligible_branches,
+                           location=data.location, package_min=data.package_min,
+                           package_max=data.package_max, drive_date=data.drive_date)
+    db.add(drive); db.commit(); db.refresh(drive)
+    return _drive_dict(drive)
+
+@app.put("/drives/{drive_id}/status", tags=["Drives"])
+def update_drive_status(drive_id: str, status: str = Query(...), db: Session = Depends(get_db)):
+    drive = db.query(PlacementDrive).filter(PlacementDrive.id == drive_id).first()
+    if not drive: raise HTTPException(404, "Drive not found")
+    drive.status = status; db.commit()
+    return {"message": f"Status updated to '{status}'"}
+
+# ── Application Routes ────────────────────────────────────────────────────────
+@app.post("/apply", tags=["Applications"])
+def apply_to_drive(req: ApplyRequest, db: Session = Depends(get_db)):
+    student = db.query(Student).filter(Student.id == req.student_id).first()
+    if not student: raise HTTPException(404, "Student not found")
+    drive = db.query(PlacementDrive).filter(PlacementDrive.id == req.drive_id).first()
+    if not drive: raise HTTPException(404, "Drive not found")
+
+    existing = db.query(Application).filter(
+        Application.student_id == req.student_id,
+        Application.drive_id == req.drive_id).first()
+    if existing:
+        return {"message": "Already applied", "application": _app_dict(existing)}
+
+    student_data = _student_dict(student)
+    drive_data   = _drive_dict(drive)
+
+    # Step 1: Policy Gateway
+    policy_result = check_eligibility(student_data, drive_data)
+    app_id = str(uuid.uuid4())
+
+    if not policy_result["passed"]:
+        application = Application(id=app_id, student_id=req.student_id, drive_id=req.drive_id,
+                                  policy_passed=False, policy_details=policy_result,
+                                  matched_skills=[], missing_skills=[], status="rejected")
+        db.add(application); db.commit()
+        create_log(db, req.student_id, req.drive_id, "POLICY_REJECTED", "FAILED",
+                   policy_result, final_decision="REJECTED", reasoning=policy_result["reasoning"])
+        return {"status": "REJECTED", "reason": "Policy check failed",
+                "policy_result": policy_result, "crs": None}
+
+    # Step 2: AI Matcher
+    crs_raw = compute_crs(student_data, drive_data)
+    crs_score  = float(crs_raw.get("crs_score") or 0)
+    sem_score  = float(crs_raw.get("semantic_score") or 0)
+    proj_score = float(crs_raw.get("project_score") or 0)
+    comp_score = float(crs_raw.get("completeness_score") or 0)
+    matched    = safe_list(crs_raw.get("matched_skills"))
+    missing    = safe_list(crs_raw.get("missing_skills"))
+    suggestions= safe_list(crs_raw.get("improvement_suggestions"))
+
+    application = Application(id=app_id, student_id=req.student_id, drive_id=req.drive_id,
+                              policy_passed=True, policy_details=policy_result,
+                              crs_score=crs_score, semantic_score=sem_score,
+                              project_score=proj_score, completeness_score=comp_score,
+                              matched_skills=matched, missing_skills=missing, status="eligible")
+    db.add(application); db.commit(); db.refresh(application)
+
+    # Step 3: Audit Log
+    create_log(db, req.student_id, req.drive_id, "AI_SCORED", "PASSED", policy_result,
+               ai_score=crs_score, missing_skills=missing, final_decision="ELIGIBLE",
+               reasoning=f"Policy: PASSED. CRS: {crs_score}/100 (Sem:{sem_score} Proj:{proj_score} Comp:{comp_score}). Missing: {', '.join(missing) or 'None'}")
+
+    return {"status": "ELIGIBLE", "application_id": app_id, "policy_result": policy_result,
+            "crs": {"crs_score": crs_score, "semantic_score": sem_score,
+                    "project_score": proj_score, "completeness_score": comp_score,
+                    "matched_skills": matched, "missing_skills": missing,
+                    "improvement_suggestions": suggestions}}
+
+@app.get("/shortlist/{drive_id}", tags=["Applications"])
+def get_shortlist(drive_id: str, db: Session = Depends(get_db)):
+    apps = (db.query(Application)
+            .filter(Application.drive_id == drive_id, Application.policy_passed == True)
+            .order_by(Application.crs_score.desc()).all())
+    results = []
+    for app in apps:
+        s = db.query(Student).filter(Student.id == app.student_id).first()
+        results.append({"rank": len(results)+1, "student_id": app.student_id,
+                        "student_name": s.name if s else "Unknown",
+                        "branch": s.branch if s else "", "cgpa": s.cgpa if s else 0,
+                        "crs_score": app.crs_score or 0, "semantic_score": app.semantic_score or 0,
+                        "project_score": app.project_score or 0, "completeness_score": app.completeness_score or 0,
+                        "matched_skills": safe_list(app.matched_skills),
+                        "missing_skills": safe_list(app.missing_skills),
+                        "status": app.status,
+                        "applied_at": app.applied_at.isoformat() if app.applied_at else None})
+    return {"drive_id": drive_id, "total_eligible": len(results), "candidates": results}
+
+@app.post("/shortlist/approve", tags=["Applications"])
+def approve_shortlist(req: ShortlistRequest, db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.student_id == req.student_id,
+                                       Application.drive_id == req.drive_id).first()
+    if not app: raise HTTPException(404, "Application not found")
+    app.status = "shortlisted"; app.shortlisted_by = req.approved_by
+    app.updated_at = datetime.datetime.utcnow(); db.commit()
+    create_log(db, req.student_id, req.drive_id, "SHORTLISTED", "PASSED",
+               ai_score=app.crs_score, final_decision="SHORTLISTED",
+               reasoning=f"Approved by {req.approved_by}. CRS: {app.crs_score}/100.", actor=req.approved_by)
+    return {"message": "Candidate shortlisted", "student_id": req.student_id}
+
+@app.get("/applications/{student_id}", tags=["Applications"])
+def get_student_applications(student_id: str, db: Session = Depends(get_db)):
+    apps = db.query(Application).filter(Application.student_id == student_id).all()
+    results = []
+    for app in apps:
+        drive = db.query(PlacementDrive).filter(PlacementDrive.id == app.drive_id).first()
+        results.append({**_app_dict(app),
+                        "company_name": drive.company_name if drive else "",
+                        "job_role": drive.job_role if drive else "",
+                        "location": drive.location if drive else "",
+                        "package_min": drive.package_min if drive else None,
+                        "package_max": drive.package_max if drive else None})
+    return results
+
+# ── Audit Routes ──────────────────────────────────────────────────────────────
+@app.get("/audit-logs", tags=["Audit"])
+def list_audit_logs(student_id: Optional[str] = None, drive_id: Optional[str] = None,
+                    limit: int = 100, db: Session = Depends(get_db)):
+    return [_log_dict(l) for l in get_logs(db, student_id, drive_id, limit)]
+
+@app.get("/audit-logs/export/json", tags=["Audit"])
+def export_json_logs(student_id: Optional[str] = None, drive_id: Optional[str] = None,
+                     db: Session = Depends(get_db)):
+    logs = get_logs(db, student_id, drive_id, 1000)
+    return Response(content=export_logs_json(logs), media_type="application/json",
+                    headers={"Content-Disposition": "attachment; filename=audit_logs.json"})
+
+@app.get("/audit-logs/export/csv", tags=["Audit"])
+def export_csv_logs(student_id: Optional[str] = None, drive_id: Optional[str] = None,
+                    db: Session = Depends(get_db)):
+    logs = get_logs(db, student_id, drive_id, 1000)
+    return Response(content=export_logs_csv(logs), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=audit_logs.csv"})
+
+# ── Analytics Routes ──────────────────────────────────────────────────────────
+@app.get("/analytics/overview", tags=["Analytics"])
+def get_analytics(db: Session = Depends(get_db)):
+    total_students = db.query(Student).count()
+    return {"total_students": total_students,
+            "total_drives": db.query(PlacementDrive).count(),
+            "active_drives": db.query(PlacementDrive).filter(PlacementDrive.status=="active").count(),
+            "total_applications": db.query(Application).count(),
+            "shortlisted": db.query(Application).filter(Application.status=="shortlisted").count(),
+            "rejected": db.query(Application).filter(Application.status=="rejected").count(),
+            "eligible": db.query(Application).filter(Application.status=="eligible").count(),
+            "placement_rate": round(db.query(Application).filter(Application.status=="shortlisted").count() / total_students * 100, 1) if total_students else 0}
+
+@app.get("/analytics/drive/{drive_id}", tags=["Analytics"])
+def drive_analytics(drive_id: str, db: Session = Depends(get_db)):
+    total = db.query(Application).filter(Application.drive_id==drive_id).count()
+    apps  = db.query(Application).filter(Application.drive_id==drive_id, Application.crs_score.isnot(None)).all()
+    return {"drive_id": drive_id, "total_applicants": total,
+            "eligible": db.query(Application).filter(Application.drive_id==drive_id, Application.status.in_(["eligible","shortlisted"])).count(),
+            "rejected": db.query(Application).filter(Application.drive_id==drive_id, Application.status=="rejected").count(),
+            "shortlisted": db.query(Application).filter(Application.drive_id==drive_id, Application.status=="shortlisted").count(),
+            "average_crs": round(sum(a.crs_score for a in apps)/len(apps),1) if apps else 0,
+            "pass_rate": round(db.query(Application).filter(Application.drive_id==drive_id, Application.status.in_(["eligible","shortlisted"])).count() / total * 100, 1) if total else 0}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _student_dict(s):
+    return {"id": s.id, "name": s.name, "email": s.email, "branch": s.branch,
+            "cgpa": s.cgpa, "active_backlogs": s.active_backlogs, "graduation_year": s.graduation_year,
+            "resume_text": s.resume_text, "skills": safe_list(s.skills),
+            "projects": safe_list(s.projects), "certifications": safe_list(s.certifications),
+            "phone": s.phone, "created_at": s.created_at.isoformat() if s.created_at else None}
+
+def _drive_dict(d):
+    return {"id": d.id, "company_name": d.company_name, "job_role": d.job_role,
+            "jd_text": d.jd_text, "required_skills": safe_list(d.required_skills),
+            "min_cgpa": d.min_cgpa, "max_backlogs": d.max_backlogs,
+            "eligible_branches": safe_list(d.eligible_branches), "location": d.location,
+            "package_min": d.package_min, "package_max": d.package_max,
+            "drive_date": d.drive_date, "status": d.status, "created_by": d.created_by,
+            "created_at": d.created_at.isoformat() if d.created_at else None}
+
+def _app_dict(a):
+    return {"id": a.id, "student_id": a.student_id, "drive_id": a.drive_id,
+            "policy_passed": a.policy_passed, "policy_details": a.policy_details,
+            "crs_score": a.crs_score or 0, "semantic_score": a.semantic_score or 0,
+            "project_score": a.project_score or 0, "completeness_score": a.completeness_score or 0,
+            "matched_skills": safe_list(a.matched_skills), "missing_skills": safe_list(a.missing_skills),
+            "status": a.status, "applied_at": a.applied_at.isoformat() if a.applied_at else None}
+
+def _log_dict(l):
+    return {"id": l.id, "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+            "student_id": l.student_id, "drive_id": l.drive_id, "action": l.action,
+            "policy_check": l.policy_check, "policy_details": l.policy_details,
+            "ai_score": l.ai_score, "missing_skills": safe_list(l.missing_skills),
+            "final_decision": l.final_decision, "reasoning": l.reasoning, "actor": l.actor}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

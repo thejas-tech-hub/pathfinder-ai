@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]==0.29.0
+sqlalchemy
+pydantic
+python-multipart==0.0.9
+pdfminer.six==20221105
+aiofiles==23.2.1
+sentence-transformers==2.7.0
+torch
+reportlab==4.2.2
+chromadb==0.5.5
